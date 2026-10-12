@@ -48,7 +48,9 @@ services:
 
   demo:
     build: { context: .., dockerfile: deploy/Dockerfile }
-    command: ["demo", "-listen", ":9090"]
+    # DB_LATENCY adds a simulated network delay to every database call (see the load-test
+    # section of the README). Default 0s = the real, local Postgres latency.
+    command: ["demo", "-listen", ":9090", "-simulate-db-latency", "${DB_LATENCY:-0s}"]
     environment:
       DATABASE_URL: postgres://cachekit:cachekit@postgres:5432/catalog?sslmode=disable
       COORDINATOR_URL: http://coordinator:8080
@@ -64,6 +66,19 @@ services:
       interval: 3s
       timeout: 2s
       retries: 10
+    restart: "no"
+
+  # Same app and database but NO cache (no COORDINATOR_URL): the baseline for load tests.
+  # Not started by `up`; start it with:  docker compose -f deploy/docker-compose.yml --profile bench up -d
+  demo-nocache:
+    build: { context: .., dockerfile: deploy/Dockerfile }
+    command: ["demo", "-listen", ":9090", "-simulate-db-latency", "${DB_LATENCY:-0s}"]
+    environment:
+      DATABASE_URL: postgres://cachekit:cachekit@postgres:5432/catalog?sslmode=disable
+    ports: ["9091:9090"]              # curl -i http://localhost:9091/products/42   (never a cache hit)
+    profiles: ["bench"]
+    depends_on:
+      postgres: { condition: service_healthy }
     restart: "no"
 
   # Not started by `up`. Run it inside the compose network so it can resolve

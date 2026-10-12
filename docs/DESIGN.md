@@ -75,6 +75,27 @@ nearly all of them (what `hash(key) % N` does).
 - Single node, one machine, `redis-benchmark`: ~65–85k ops/s unpipelined, hundreds
   of thousands with `-P 16`. Relative numbers only — client and server share the host.
 
+## Load testing method (cmd/loadgen)
+- **Zipf keys (s = 1.1, 1000 keys):** realistic skew; the hottest ~10 keys take about half
+  the reads. Seeded, so a run is reproducible and node placement of the hot keys is fixed.
+- **Open loop, latency from the scheduled send time:** avoids coordinated omission. A closed
+  loop under-reports the very latency a failure causes.
+- **Latency percentiles are over successful requests only;** errors are counted separately so
+  a timeout cannot flatter a percentile.
+- **Simulated DB latency (`DB_LATENCY`):** local Postgres is ~1 ms, which makes the cache look
+  pointless. The simulated delay is applied to every database call and every result is labelled.
+- **Hit ratio counts a database fallback as a miss,** so a dead cache node shows up as a hit-ratio
+  dip, not as errors. "Recovery time" = seconds from the event until the per-second hit ratio is
+  within 5 points of the pre-event baseline for 3 consecutive seconds.
+- **What bounds the dip:** detection (the coordinator's heartbeat timeout, 3 s here) plus refill
+  (each moved key costs one miss). A graceful stop deregisters first and skips the detection window.
+- **Limits:** one machine (generator, app, Docker share CPU), one run, 1-second buckets.
+
+## Measured results: load test (cmd/loadgen; Windows laptop, Docker Desktop, 5 ms simulated DB latency)
+- 500 req/s, Zipf hot keys: cache 98.0% hit ratio, p50 2.4 ms vs 8.1 ms without cache; database reads 48 vs 908 per 1000 requests (about 95% fewer).
+- Hard-killing the node that owns about 47% of requests (400 req/s): 0 failed requests, hit ratio down to 53% in the worst second and back within 5 points after 3 s; restart dip to 86%, back after 6 s.
+- During the crash window p99 reached about 509 ms: two 250 ms cache timeouts (failed GET + failed SET) per request routed to the dead node until the coordinator removes it. Known issue; fix is to skip the fill after a failed read and/or add a per-node circuit breaker.
+
 ## Known limitations (say them before the interviewer does)
 Single coordinator; no replication or persistence; no authentication or TLS; one
 mutex per store; item-count (not byte) bound on memory; the 150-vnode default is

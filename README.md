@@ -36,6 +36,7 @@ request pays an extra network hop. The coordinator is control plane only.
 | `api/` | Demo HTTP/JSON API over `catalog.Service`. |
 | `cmd/node`, `cmd/coordinator` | The two server programs. |
 | `cmd/demo` | The product-catalog demo app (HTTP API + PostgreSQL + the cache). |
+| `loadtest/`, `cmd/loadgen` | Hot-key (Zipf) open-loop load generator with scheduled node crashes; per-second CSVs and a summary table. |
 | `cmd/cachectl` | CLI to poke a cluster (`status`, `get`, `set`, `fill`, `check`...). |
 | `cmd/experiment` | Produces the report graphs' data (remap % and load balance). |
 | `deploy/` | Dockerfile + docker-compose (coordinator, 3 nodes, Postgres, demo app). |
@@ -176,6 +177,125 @@ Useful flags: `-cache-ttl`, `-negative-ttl`, `-op-timeout`, and
 Postgres answers in ~1 ms, which hides the benefit of a cache; label any numbers
 measured this way as simulated latency).
 
+## Load test: a hot-key workload and a cache-node crash
+
+`cmd/loadgen` drives the demo API the way real cache traffic looks and records
+what the *application* experienced, second by second: hit ratio, latency
+percentiles, errors, and which cache node owned each requested key.
+
+- **Hot keys.** Product ids are drawn from a Zipf distribution (exponent 1.1 over
+  the 1000 seeded products): a handful of products get a large share of all reads
+  (in a default run the 10 hottest receive about half), which is what makes a
+  cache worth having and makes losing a node interesting.
+- **Open-loop load.** Requests go out on a fixed schedule (default 400/s) no matter
+  how slowly the server answers, and each latency is measured from the moment the
+  request was *scheduled*. A closed loop (each worker waits for its response)
+  silently lowers the load exactly when the server struggles and hides the spike.
+- **Scheduled events.** `-event "<offset>|<label>|<command>"` runs a command at a
+  chosen second (`docker kill ...`, `docker start ...`) and draws it on the graph.
+- **Simulated database latency.** A Postgres on localhost answers in about a
+  millisecond, which hides what a cache is for. `DB_LATENCY=5ms` adds a 5 ms delay
+  to every database call, standing in for a database on another machine. Every
+  number below is labelled as measured with it.
+
+**Run it** (PowerShell, in the project folder). Build the tools once (running from
+`bin\` also avoids Windows blocking freshly compiled temp executables):
+
+```powershell
+go build -o bin\loadgen.exe .\cmd\loadgen
+pip install matplotlib
+```
+
+Start the stack with simulated database latency, plus the no-cache twin of the app
+(port 9091, same database, used as the baseline):
+
+```powershell
+$env:DB_LATENCY = "5ms"
+docker compose -f deploy/docker-compose.yml --profile bench up -d --build
+```
+
+**1. With vs. without the cache** (steady state, 40 s each; the freshly started cache is
+cold, so the first 10 s, while it fills, are excluded from the table but still plotted):
+
+```powershell
+.\bin\loadgen.exe -url http://127.0.0.1:9091 -duration 40s -rate 500 -out docs/results/nocache
+.\bin\loadgen.exe -url http://127.0.0.1:9090 -duration 40s -rate 500 -out docs/results/cached
+```
+
+**2. Crash a cache node under load, then bring it back.** The cache starts cold, so
+restart the nodes first. Under the default seed, `node3` owns the largest share of
+the traffic (about 47% in a reference run), so killing it shows the effect clearly;
+a node that owns about a quarter of the traffic shows a smaller dip.
+
+```powershell
+docker compose -f deploy/docker-compose.yml restart node1 node2 node3
+Start-Sleep 5                                                              # let the ring settle
+.\bin\loadgen.exe -url http://127.0.0.1:9090 -duration 90s -rate 400 -out docs/results/failure `
+    -event "30s|crash node3|docker kill cachekit-node3-1" `
+    -event "60s|restart node3|docker start cachekit-node3-1"
+python docs/plot_failure.py docs/results/failure
+```
+
+`docker kill` is a hard crash (SIGKILL): the node never tells the coordinator, so
+the cluster only notices when heartbeats stop. (`docker stop` is a graceful leave
+and would hide the detection window.) Each run writes `timeseries.csv`,
+`nodes.csv`, `events.csv` and `summary.md` (a README-ready table plus a one-line
+"dip and recovery" per event); `plot_failure.py` adds `failure.png`.
+
+**Results** (one reference run on a Windows laptop with Docker Desktop; 3 cache nodes, PostgreSQL with **5 ms simulated database latency**, load generator on the same machine):
+
+*With vs. without the cache* (500 req/s for 40 s, first 10 s excluded):
+
+| | Hit ratio | p50 | p95 | p99 | Database reads per 1000 requests | Errors |
+|---|---:|---:|---:|---:|---:|---:|
+| No cache | n/a | 8.1 ms | 9.0 ms | 10.2 ms | 908 | 0 |
+| With cache | 98.0% | 2.4 ms | 3.3 ms | 9.0 ms | 48 | 0 |
+
+The cache cut database reads by about 95% and median latency by about 70%. (No-cache reads are
+slightly under 1000 because concurrent reads of the same hot key share one database load.)
+
+*Crash of the busiest cache node* (`node3`, which owns about 47% of requests; hard kill at 30 s, restart at 60 s; 400 req/s for 90 s, first 10 s excluded):
+
+| Phase | Window | Hit ratio | p50 | p95 | p99 | Max | Errors |
+|---|---|---:|---:|---:|---:|---:|---:|
+| before the crash | 10–30 s | 96.3% | 2.4 ms | 4.1 ms | 9.5 ms | 15.8 ms | 0 |
+| after the crash (includes refill) | 30–60 s | 93.2% | 2.6 ms | 9.1 ms | 508.9 ms | 521.9 ms | 0 |
+| after the restart | 60–90 s | 93.8% | 2.5 ms | 8.5 ms | 9.7 ms | 12.1 ms | 0 |
+
+- **No request failed**, including during the crash: about 36,000 requests in the run.
+- **Crash:** the hit ratio fell to 53% in the worst second and was back within 5 points of normal after **3 s**
+  (the coordinator's 3 s heartbeat timeout, then the dead node's keys re-homed on the survivors).
+- **Restart:** a smaller dip, to 86%, back to normal in **6 s** while the returning node refilled its empty cache.
+- **The cost of a crash is latency, not errors.** The crash window's p99 rose to about 509 ms. That matches two
+  250 ms cache timeouts per request (the failed `GET`, then the failed `SET`) for keys that still route to the dead
+  node until the coordinator removes it. Skipping the cache fill after a failed read, or a per-node circuit
+  breaker that stops trying a node that just failed, would shrink that spike; it is listed as the next improvement.
+
+
+![Cache node crash under a hot-key workload](docs/results/failure/failure.png)
+
+**How to read the graph.** Top to bottom: the hit ratio; request latency (p50 / p95 /
+p99, log scale); requests by the cache node that owns the key (traffic moving off
+the dead node and back); and request outcomes. Vertical lines mark the crash and
+the restart; the grey band is the cold-cache warm-up.
+
+**What to expect, and why:**
+1. *Crash.* Reads for the dead node's keys fall back to PostgreSQL, so the hit
+   ratio drops immediately and **no request fails**. Until the coordinator's
+   heartbeat timeout (3 s) passes, the client still routes those keys to the dead node.
+2. *Re-homing.* The coordinator drops the node and bumps the ring version; the
+   client picks it up by long-poll, and the dead node's keys spread over the
+   survivors (only those keys move). The first read of each moved key is a miss that
+   refills the cache, so the hot keys come back within seconds and the tail refills
+   as it is requested.
+3. *Restart.* The node rejoins with the same ID, so it gets its old key ranges
+   back, with an empty cache: a second, smaller dip while it refills.
+
+Caveats, stated plainly: the load generator, the app and Docker all share one
+laptop, so absolute numbers say little and relative ones say more; the database
+latency is simulated; one run is not a distribution (repeat it and report the
+spread before quoting a number).
+
 ## Reproduce the headline graphs
 
 ```powershell
@@ -197,6 +317,7 @@ to long-poll), `GET /status`, `GET /events`, `GET /healthz`.
 Done: ring (phase 1), store (2), RESP server (3), client (4), coordinator (5),
 Docker Compose cluster, the two experiments, `redis-benchmark` compatibility,
 and the cache-aside demo app (Postgres + HTTP API).
-Not built yet: load generator with failure graphs, dashboard.
+The load generator with failure graphs (see above).
+Not built yet: dashboard.
 Not built yet: the PostgreSQL cache-aside demo app (phase 6), the Zipfian load
 generator and failure-injection graphs (7), the web dashboard (8).
