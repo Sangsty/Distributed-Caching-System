@@ -50,7 +50,8 @@ services:
     build: { context: .., dockerfile: deploy/Dockerfile }
     # DB_LATENCY adds a simulated network delay to every database call (see the load-test
     # section of the README). Default 0s = the real, local Postgres latency.
-    command: ["demo", "-listen", ":9090", "-simulate-db-latency", "${DB_LATENCY:-0s}"]
+    # BREAKER_THRESHOLD=0 turns the client's per-node circuit breaker off (for before/after tests).
+    command: ["demo", "-listen", ":9090", "-simulate-db-latency", "${DB_LATENCY:-0s}", "-breaker-threshold", "${BREAKER_THRESHOLD:-3}"]
     environment:
       DATABASE_URL: postgres://cachekit:cachekit@postgres:5432/catalog?sslmode=disable
       COORDINATOR_URL: http://coordinator:8080

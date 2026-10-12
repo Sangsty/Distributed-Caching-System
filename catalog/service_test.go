@@ -486,3 +486,23 @@ func TestInputValidate(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestNoCacheWriteAfterCacheReadError(t *testing.T) {
+	s, repo, fc := newTestService(t)
+	fc.failGet = true // reads fail, writes would succeed
+	for _, id := range []int64{1, 999} {
+		s.Get(context.Background(), id) // 999 does not exist: also must not write a negative entry
+	}
+	if fc.sets != 0 {
+		t.Fatalf("made %d cache writes after the read had failed; want none", fc.sets)
+	}
+	if repo.Reads() != 2 {
+		t.Fatalf("db reads = %d, want 2", repo.Reads())
+	}
+	// Once the cache reads work again, normal filling resumes.
+	fc.failGet = false
+	s.Get(context.Background(), 1)
+	if !fc.has(cacheKey(1)) {
+		t.Fatal("cache should be filled once reads succeed again")
+	}
+}

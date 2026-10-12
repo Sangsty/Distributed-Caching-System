@@ -33,14 +33,15 @@ type nodePool struct {
 	addr        string
 	dialTimeout time.Duration
 	maxIdle     int
+	brk         *breaker // nil = circuit breaker disabled
 
 	mu     sync.Mutex
 	idle   []*conn
 	closed bool
 }
 
-func newPool(addr string, dialTimeout time.Duration, maxIdle int) *nodePool {
-	return &nodePool{addr: addr, dialTimeout: dialTimeout, maxIdle: maxIdle}
+func newPool(addr string, dialTimeout time.Duration, maxIdle int, brk *breaker) *nodePool {
+	return &nodePool{addr: addr, dialTimeout: dialTimeout, maxIdle: maxIdle, brk: brk}
 }
 
 // get returns an idle connection (reused=true) or dials a new one. fresh=true

@@ -54,6 +54,8 @@ func run() error {
 	negTTL := flag.Duration("negative-ttl", 15*time.Second, "lifetime of a cached 'product does not exist'")
 	opTimeout := flag.Duration("op-timeout", 250*time.Millisecond, "timeout for one cache operation")
 	dialTimeout := flag.Duration("dial-timeout", 250*time.Millisecond, "timeout for connecting to a cache node")
+	brkThreshold := flag.Int("breaker-threshold", 3, "consecutive failures before a cache node is skipped (0 = disable the circuit breaker)")
+	brkCooldown := flag.Duration("breaker-cooldown", time.Second, "how long a failed cache node is skipped before one probe call")
 	simLatency := flag.Duration("simulate-db-latency", 0, "add this delay to every database call (demo/benchmark only)")
 	flag.Parse()
 
@@ -93,7 +95,10 @@ func run() error {
 	// ---- cache ----
 	var cache catalog.Cache = catalog.NopCache{}
 	if *coordURL != "" {
-		c, err := connectCache(*coordURL, client.Options{DialTimeout: *dialTimeout, OpTimeout: *opTimeout}, 30*time.Second, log)
+		c, err := connectCache(*coordURL, client.Options{
+			DialTimeout: *dialTimeout, OpTimeout: *opTimeout,
+			BreakerThreshold: breakerThreshold(*brkThreshold), BreakerCooldown: *brkCooldown,
+		}, 30*time.Second, log)
 		if err != nil {
 			return err
 		}
@@ -132,6 +137,14 @@ func run() error {
 	return srv.Shutdown(shutdownCtx)
 }
 
+// breakerThreshold maps the flag (0 = off) to the client option (negative = off, 0 = default).
+func breakerThreshold(flagValue int) int {
+	if flagValue <= 0 {
+		return -1
+	}
+	return flagValue
+}
+
 // openPostgres opens a connection pool and waits (up to 30s) for the database
 // to accept connections, because in docker compose it may still be starting.
 func openPostgres(url string, maxConns int) (*sql.DB, error) {
@@ -167,6 +180,7 @@ func connectCache(coordURL string, opts client.Options, wait time.Duration, log 
 	for {
 		c, err := client.New(client.Options{
 			CoordinatorURL: coordURL, DialTimeout: opts.DialTimeout, OpTimeout: opts.OpTimeout,
+			BreakerThreshold: opts.BreakerThreshold, BreakerCooldown: opts.BreakerCooldown,
 		})
 		if err == nil {
 			return c, nil

@@ -31,6 +31,7 @@ nearly all of them (what `hash(key) % N` does).
 | Availability over consistency | It is a cache: a miss falls back to the database | Reads can be stale in races; TTL + invalidate-on-write bound it |
 | No replication | Keeps MVP small; crash = those keys are cold | Lost keys cause a burst of DB load (thundering herd). Stretch: replicate to next R nodes |
 | Raw TCP + RESP subset | `redis-cli` and `redis-benchmark` work unchanged | Only ~12 commands. Say "RESP-compatible subset", not "Redis-compatible" |
+| Per-node circuit breaker in the client | A dead-but-not-yet-evicted node would otherwise cost every request a full timeout | A node that hiccups once is skipped for a cooldown (1 s), so its keys go to the database briefly; thresholds (3 failures, 1 s) are tuned for this demo, not universal |
 | Full-table mutex in store | Obviously correct | Contention on many cores. Stretch: sharded locks |
 | XXH64 written in-repo | Zero dependencies; tested against reference vectors | Not a vetted library; swap to `cespare/xxhash` if preferred (same function) |
 
@@ -94,7 +95,7 @@ nearly all of them (what `hash(key) % N` does).
 ## Measured results: load test (cmd/loadgen; Windows laptop, Docker Desktop, 5 ms simulated DB latency)
 - 500 req/s, Zipf hot keys: cache 98.0% hit ratio, p50 2.4 ms vs 8.1 ms without cache; database reads 48 vs 908 per 1000 requests (about 95% fewer).
 - Hard-killing the node that owns about 47% of requests (400 req/s): 0 failed requests, hit ratio down to 53% in the worst second and back within 5 points after 3 s; restart dip to 86%, back after 6 s.
-- During the crash window p99 reached about 509 ms: two 250 ms cache timeouts (failed GET + failed SET) per request routed to the dead node until the coordinator removes it. Known issue; fix is to skip the fill after a failed read and/or add a per-node circuit breaker.
+- During the crash window p99 reached about 509 ms: two 250 ms cache timeouts (failed GET + failed SET) per request routed to the dead node until the coordinator removes it. Fixed by (1) not refilling the cache after a failed read and (2) a per-node circuit breaker in the client (see the README).
 
 ## Known limitations (say them before the interviewer does)
 Single coordinator; no replication or persistence; no authentication or TLS; one

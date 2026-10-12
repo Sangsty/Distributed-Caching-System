@@ -7,7 +7,9 @@
 // *NodeError. The caller (typically cache-aside code) should treat that like a
 // cache miss and fall back to the database. The client never "re-routes" a key
 // to another node on its own; once the coordinator declares the node dead the
-// ring changes and the key is owned by the next node.
+// ring changes and the key is owned by the next node. Until then a per-node
+// circuit breaker (see breaker.go) stops the client from waiting out a full
+// timeout on every request to a node that has just failed.
 package client
 
 import (
@@ -52,6 +54,13 @@ type Options struct {
 	MaxIdlePerNode int           // idle connections kept per node, default 8
 	PollWait       time.Duration // coordinator long-poll length, default 10s
 	VNodes         int           // NewStatic only; default ring.DefaultVNodes
+
+	// Per-node circuit breaker: after BreakerThreshold consecutive transport
+	// failures the node is skipped (calls fail instantly with ErrCircuitOpen) for
+	// BreakerCooldown, then one probe call decides whether it is back. This keeps
+	// a dead-but-not-yet-evicted node from adding a full timeout to every request.
+	BreakerThreshold int           // default 3; a negative value disables the breaker
+	BreakerCooldown  time.Duration // default 1s
 }
 
 func (o *Options) defaults() {
@@ -149,7 +158,8 @@ func (c *Client) apply(m cluster.Membership) {
 		if p, ok := c.pools[n.ID]; ok && p.addr == n.Addr {
 			next[n.ID] = p
 		} else {
-			next[n.ID] = newPool(n.Addr, c.opts.DialTimeout, c.opts.MaxIdlePerNode)
+			next[n.ID] = newPool(n.Addr, c.opts.DialTimeout, c.opts.MaxIdlePerNode,
+				newBreaker(c.opts.BreakerThreshold, c.opts.BreakerCooldown))
 		}
 	}
 	var stale []*nodePool
@@ -262,10 +272,15 @@ func (c *Client) do(key string, args ...[]byte) (resp.Value, error) {
 	if !ok || p == nil {
 		return resp.Value{}, ErrNoNodes
 	}
+	if !p.brk.allow() {
+		return resp.Value{}, &NodeError{NodeID: id, Err: ErrCircuitOpen}
+	}
 	v, err := p.roundTrip(c.opts.OpTimeout, args)
 	if err != nil {
+		p.brk.failure()
 		return resp.Value{}, &NodeError{NodeID: id, Err: err}
 	}
+	p.brk.success() // any reply, even an error reply, proves the node is alive
 	if v.Type == resp.Error {
 		return resp.Value{}, &ServerError{Msg: string(v.Str)}
 	}

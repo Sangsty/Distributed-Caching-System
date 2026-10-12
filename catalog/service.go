@@ -105,9 +105,13 @@ func (s *Service) warnCache(op string, err error) {
 func (s *Service) Get(ctx context.Context, id int64) (Product, Source, error) {
 	key := cacheKey(id)
 
+	// fill is false when the cache just failed us: writing to a node that could not
+	// answer a read would only cost a second timeout for no benefit.
+	fill := true
 	b, found, err := s.cache.Get(key)
 	switch {
 	case err != nil:
+		fill = false
 		s.cacheErrors.Add(1)
 		s.warnCache("get", err)
 	case found && bytes.Equal(b, notFoundMarker):
@@ -126,7 +130,7 @@ func (s *Service) Get(ctx context.Context, id int64) (Product, Source, error) {
 		s.misses.Add(1)
 	}
 
-	v, err, coalesced := s.flight.Do(key, func() (any, error) { return s.load(ctx, id, key) })
+	v, err, coalesced := s.flight.Do(key, func() (any, error) { return s.load(ctx, id, key, fill) })
 	if coalesced {
 		s.coalesced.Add(1)
 	}
@@ -140,7 +144,7 @@ func (s *Service) Get(ctx context.Context, id int64) (Product, Source, error) {
 // flight.Do, shared by every request waiting on the same key, so it must not
 // depend on any single caller's context: if the request that started the load
 // is cancelled, the others still need the result. It gets its own timeout.
-func (s *Service) load(ctx context.Context, id int64, key string) (any, error) {
+func (s *Service) load(ctx context.Context, id int64, key string, fill bool) (any, error) {
 	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.LoadTimeout)
 	defer cancel()
 
@@ -148,13 +152,17 @@ func (s *Service) load(ctx context.Context, id int64, key string) (any, error) {
 	p, err := s.repo.Get(lctx, id)
 	switch {
 	case errors.Is(err, ErrNotFound):
-		s.cacheSet(key, notFoundMarker, s.cfg.NegativeTTL)
+		if fill {
+			s.cacheSet(key, notFoundMarker, s.cfg.NegativeTTL)
+		}
 		return nil, ErrNotFound
 	case err != nil:
 		return nil, err
 	}
-	if b, err := json.Marshal(p); err == nil {
-		s.cacheSet(key, b, s.jitter(s.cfg.TTL))
+	if fill {
+		if b, err := json.Marshal(p); err == nil {
+			s.cacheSet(key, b, s.jitter(s.cfg.TTL))
+		}
 	}
 	return p, nil
 }

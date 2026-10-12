@@ -268,8 +268,8 @@ slightly under 1000 because concurrent reads of the same hot key share one datab
 - **Restart:** a smaller dip, to 86%, back to normal in **6 s** while the returning node refilled its empty cache.
 - **The cost of a crash is latency, not errors.** The crash window's p99 rose to about 509 ms. That matches two
   250 ms cache timeouts per request (the failed `GET`, then the failed `SET`) for keys that still route to the dead
-  node until the coordinator removes it. Skipping the cache fill after a failed read, or a per-node circuit
-  breaker that stops trying a node that just failed, would shrink that spike; it is listed as the next improvement.
+  node until the coordinator removes it. The next section removes most of that.
+
 
 
 ![Cache node crash under a hot-key workload](docs/results/failure/failure.png)
@@ -295,6 +295,50 @@ Caveats, stated plainly: the load generator, the app and Docker all share one
 laptop, so absolute numbers say little and relative ones say more; the database
 latency is simulated; one run is not a distribution (repeat it and report the
 spread before quoting a number).
+
+### Fixing the crash-window latency: a per-node circuit breaker
+
+The measurement above exposed a real flaw: for the ~3 s before the coordinator evicts a dead node, every request for
+that node's keys waited out a full cache timeout, and then waited out a second one when the app tried to refill the
+cache. Two changes fix it:
+
+- **The app no longer writes to a cache node whose read just failed** (`catalog.Service`): the write would only cost a
+  second timeout. This halves the spike on its own.
+- **The client has a per-node circuit breaker** (`client/breaker.go`). After 3 consecutive transport failures it stops
+  calling that node and fails instantly (`ErrCircuitOpen`, still a `*NodeError`, so the app falls back to the
+  database at once). After a 1 s cooldown it lets exactly one probe call through: success closes the breaker,
+  failure re-opens it. Error replies from a live node never trip it. By the time the coordinator evicts the node the
+  breaker has already absorbed the failure; if the node comes back, the next probe closes the breaker.
+
+Re-run the crash test with the breaker off and on. `BREAKER_THRESHOLD=0` disables it (compose passes it to the demo):
+
+```powershell
+# A: breaker OFF (only the "no refill after a failed read" fix)
+$env:DB_LATENCY = "5ms"; $env:BREAKER_THRESHOLD = "0"
+docker compose -f deploy/docker-compose.yml up -d --build --force-recreate
+docker compose -f deploy/docker-compose.yml restart node1 node2 node3; Start-Sleep 5
+.\bin\loadgen.exe -url http://127.0.0.1:9090 -duration 90s -rate 400 -out docs/results/failure-nobreaker `
+    -event "30s|crash node3|docker kill cachekit-node3-1" `
+    -event "60s|restart node3|docker start cachekit-node3-1"
+
+# B: breaker ON (the default)
+$env:BREAKER_THRESHOLD = "3"
+docker compose -f deploy/docker-compose.yml up -d --force-recreate demo
+docker compose -f deploy/docker-compose.yml restart node1 node2 node3; Start-Sleep 5
+.\bin\loadgen.exe -url http://127.0.0.1:9090 -duration 90s -rate 400 -out docs/results/failure-breaker `
+    -event "30s|crash node3|docker kill cachekit-node3-1" `
+    -event "60s|restart node3|docker start cachekit-node3-1"
+python docs/plot_failure.py docs/results/failure-breaker
+```
+
+Measured results (Docker, 3 cache nodes, 400 req/s open-loop, Zipf 1.1, 5 ms simulated DB latency, `docker kill` of node3 at 30 s). Both runs used the no-refill-after-failed-read change; only the breaker differs:
+
+| Run | Window | p50 ms | p95 ms | p99 ms | Max ms | Errors |
+|---|---|---:|---:|---:|---:|---:|
+| A: breaker off | 30-60 s (after crash) | 2.5 | 9.0 | **259.1** | 287.5 | 0 |
+| B: breaker on | 30-60 s (after crash) | 2.6 | 8.5 | **9.9** | 259.4 | 0 |
+
+The crash-window p99 drops from 259 ms to 9.9 ms (about 26x), back to the pre-crash level (9.4-9.6 ms). Before either fix, the same test showed a p99 of 509 ms (two 250 ms timeouts per request: the failed read, then the failed refill). The max stays near 250 ms in both runs because the first few requests must still hit the timeout to trip the breaker. The worst-second hit ratio is 53% in both runs: the breaker removes the latency cost of the dead node, not the cache misses for its keys. Raw data: `docs/results/failure-nobreaker` and `docs/results/failure-breaker`.
 
 ## Reproduce the headline graphs
 
