@@ -4,7 +4,8 @@ A from-scratch distributed in-memory cache in Go. Keys are spread over cache
 nodes with a **consistent-hash ring (virtual nodes)**, nodes speak a **Redis-
 compatible protocol (RESP subset)** over raw TCP, and a **coordinator** detects
 dead nodes by heartbeat and publishes a versioned ring that clients follow.
-No external Go dependencies.
+The cache itself has no external Go dependencies; only the demo app uses one
+(the `pgx` PostgreSQL driver).
 
 ```
                        heartbeats / ring (HTTP+JSON)
@@ -30,10 +31,14 @@ request pays an extra network hop. The coordinator is control plane only.
 | `coordinator/` | Heartbeats, failure detection, versioned membership, HTTP API. |
 | `node/` | A node's lifecycle: store + server + heartbeat loop. |
 | `client/` | Pooled client with local ring; follows the coordinator. |
+| `flight/` | Single-flight: concurrent loads of the same key share one database call. |
+| `catalog/` | Demo domain: products, cache-aside `Service`, Postgres and in-memory repositories. |
+| `api/` | Demo HTTP/JSON API over `catalog.Service`. |
 | `cmd/node`, `cmd/coordinator` | The two server programs. |
+| `cmd/demo` | The product-catalog demo app (HTTP API + PostgreSQL + the cache). |
 | `cmd/cachectl` | CLI to poke a cluster (`status`, `get`, `set`, `fill`, `check`...). |
 | `cmd/experiment` | Produces the report graphs' data (remap % and load balance). |
-| `deploy/` | Dockerfile + docker-compose (coordinator + 3 nodes). |
+| `deploy/` | Dockerfile + docker-compose (coordinator, 3 nodes, Postgres, demo app). |
 | `docs/` | `DESIGN.md` (decisions, trade-offs, interview Q&A), results + plot script. |
 
 ## Run the tests
@@ -108,6 +113,69 @@ Container names can differ slightly by Docker version; `docker ps` shows them.
 etc., which only resolves there. From the host, `curl http://localhost:8080/status`
 shows the cluster and nodes are also published on ports 7001–7003.
 
+## Demo app: product catalog with cache-aside (Docker + PostgreSQL)
+
+A small REST API whose reads go **cache → database**. It shows what the cache is
+for, and what happens to an application when a cache node dies.
+
+**One-time setup** (the demo needs the `pgx` driver, so fetch it and create `go.sum`):
+
+```powershell
+cd P:\Distributed-Cache-Project
+go mod tidy
+go vet ./...
+go test ./...
+```
+
+**Run everything** (coordinator, 3 cache nodes, PostgreSQL with 1000 seeded
+products, the demo API):
+
+```powershell
+docker compose -f deploy/docker-compose.yml up --build
+```
+
+**Try it** (`curl.exe` on Windows PowerShell; plain `curl` is an alias for something else):
+
+```powershell
+curl.exe -i http://localhost:9090/products/42        # X-Cache: MISS, X-Cache-Node: nodeN
+curl.exe -i http://localhost:9090/products/42        # X-Cache: HIT  (same node)
+curl.exe -i http://localhost:9090/products/99999     # 404, MISS
+curl.exe -i http://localhost:9090/products/99999     # 404, HIT (negative caching)
+curl.exe "http://localhost:9090/products?limit=5&offset=10"
+curl.exe -i -X PUT http://localhost:9090/products/42 -H "Content-Type: application/json" -d "{\"name\":\"Renamed\",\"price_cents\":999,\"stock\":5}"
+curl.exe -i http://localhost:9090/products/42        # MISS again: the write invalidated the cache, then HIT
+curl.exe http://localhost:9090/stats                 # hits, misses, db_reads, hit_ratio, ring
+```
+
+**Kill a cache node while the app is running:**
+
+```powershell
+curl.exe -i http://localhost:9090/products/42        # note X-Cache-Node, e.g. node2
+docker stop cachekit-node2-1                         # (use the node the header named)
+curl.exe -i http://localhost:9090/products/42        # still 200: X-Cache: MISS, served from PostgreSQL
+# ~3 s later the coordinator drops the node and its keys re-home on the survivors:
+curl.exe -i http://localhost:9090/products/42        # MISS on the new node...
+curl.exe -i http://localhost:9090/products/42        # ...then HIT
+docker start cachekit-node2-1                        # node returns; its key range comes back (cold)
+```
+
+PostgreSQL is also published on `localhost:5433` (user/password/db: `cachekit` /
+`cachekit` / `catalog`) if you want to look at the data with `psql` or a GUI.
+`docker compose ... down` discards the data (no volume), which resets the seed.
+
+**No Docker, no database** (in-memory products), against the no-Docker cluster
+from the section above:
+
+```powershell
+go run ./cmd/demo -store memory -coordinator http://localhost:8080   # with the cache
+go run ./cmd/demo -store memory                                      # no cache: baseline
+```
+
+Useful flags: `-cache-ttl`, `-negative-ttl`, `-op-timeout`, and
+`-simulate-db-latency 5ms` (adds delay to every database call: a localhost
+Postgres answers in ~1 ms, which hides the benefit of a cache; label any numbers
+measured this way as simulated latency).
+
 ## Reproduce the headline graphs
 
 ```powershell
@@ -127,6 +195,8 @@ to long-poll), `GET /status`, `GET /events`, `GET /healthz`.
 ## Status vs. the roadmap
 
 Done: ring (phase 1), store (2), RESP server (3), client (4), coordinator (5),
-Docker Compose cluster, the two experiments, `redis-benchmark` compatibility.
+Docker Compose cluster, the two experiments, `redis-benchmark` compatibility,
+and the cache-aside demo app (Postgres + HTTP API).
+Not built yet: load generator with failure graphs, dashboard.
 Not built yet: the PostgreSQL cache-aside demo app (phase 6), the Zipfian load
 generator and failure-injection graphs (7), the web dashboard (8).

@@ -34,6 +34,28 @@ nearly all of them (what `hash(key) % N` does).
 | Full-table mutex in store | Obviously correct | Contention on many cores. Stretch: sharded locks |
 | XXH64 written in-repo | Zero dependencies; tested against reference vectors | Not a vetted library; swap to `cespare/xxhash` if preferred (same function) |
 
+## Demo app: cache-aside (catalog/)
+- **Read:** cache hit returns; miss loads from PostgreSQL (one load per key at a time,
+  see `flight/`), stores the result with a TTL (60 s ±10% jitter), returns it.
+- **Write:** update PostgreSQL first, then **delete** the cached key (not "update the
+  cache"): the next read reloads it. A failed database write never touches the cache.
+- **Cache is an optimisation, not a dependency:** any cache error (node down, timeout)
+  is counted, logged at most every 5 s, and the request is served from the database.
+  A failed invalidation leaves the old copy until its TTL expires; the TTL is what bounds staleness.
+- **Negative caching:** a missing id is cached as a marker for 15 s so repeated lookups
+  of ids that do not exist do not each reach the database. `Create` invalidates the new
+  id's key so a stale "not found" cannot hide a new product.
+- **TTL jitter:** keys cached together would expire together and stampede the database.
+- **Single-flight:** N concurrent misses on one key make one database call. The shared
+  load uses its own timeout and does not inherit the first caller's context, so one
+  cancelled request cannot fail the others.
+- **Known race (accepted):** reader misses and loads the old row; a writer updates the
+  row and deletes the key; the reader then caches the old row. Stale for at most one TTL.
+  Fixes if it mattered: versioned values / compare-and-set, or shorter TTLs.
+- **Cached values are validated:** an entry that does not parse, or whose id differs from
+  its key, is dropped and treated as a miss.
+- Not covered: list pages are not cached; a hot key still concentrates on one node.
+
 ## Failure semantics (what actually happens)
 - **Node crashes:** its connections break. Client calls to it return `*NodeError`
   (caller falls back to the DB). After the heartbeat timeout the coordinator marks
@@ -65,5 +87,5 @@ a measured trade-off, not a universal constant.
 4. **What if a client's ring is stale?** Wrong node → miss, not wrong data. It converges on the next long-poll return.
 5. **Coordinator single point of failure?** Yes; data path survives, membership freezes. Fix: Raft/etcd or gossip.
 6. **Why no retry on timeout?** It doubles tail latency and the node is probably overloaded. A reused-connection failure that returns instantly is retried once on a fresh connection.
-7. **What happens to hot keys / stampedes?** Not handled in the cache; the demo app will use `singleflight`.
+7. **What happens to hot keys / stampedes?** Not handled in the cache itself; the demo app coalesces concurrent misses per key (`flight/`) and jitters TTLs. A single very hot key still lives on one node.
 8. **CAP?** Availability over consistency; a cache can serve a miss.

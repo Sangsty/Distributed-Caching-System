@@ -31,6 +31,41 @@ services:
     command: ["node", "-id", "node3", "-listen", ":7001", "-advertise", "node3:7001", "-coordinator", "http://coordinator:8080"]
     ports: ["7003:7001"]
 
+  # ---- demo application: product catalog (cache-aside over the cluster) ----
+  postgres:
+    build: ./postgres                 # postgres:16 + schema and 1000 seed products
+    environment:
+      POSTGRES_USER: cachekit
+      POSTGRES_PASSWORD: cachekit
+      POSTGRES_DB: catalog
+    ports: ["5433:5432"]              # 5433 so it does not clash with a Postgres already on your machine
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cachekit -d catalog"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    # No volume: `docker compose down` resets the data to the seed.
+
+  demo:
+    build: { context: .., dockerfile: deploy/Dockerfile }
+    command: ["demo", "-listen", ":9090"]
+    environment:
+      DATABASE_URL: postgres://cachekit:cachekit@postgres:5432/catalog?sslmode=disable
+      COORDINATOR_URL: http://coordinator:8080
+    ports: ["9090:9090"]              # curl -i http://localhost:9090/products/42
+    depends_on:
+      coordinator: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      node1: { condition: service_started }
+      node2: { condition: service_started }
+      node3: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+    restart: "no"
+
   # Not started by `up`. Run it inside the compose network so it can resolve
   # node1/node2/node3:   docker compose -f deploy/docker-compose.yml run --rm cachectl fill 10000
   cachectl:
