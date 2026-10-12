@@ -1,0 +1,41 @@
+# Run from the project root:
+#   docker compose -f deploy/docker-compose.yml up --build
+name: cachekit   # fixes the network name to "cachekit_default"
+
+services:
+  coordinator:
+    build: { context: .., dockerfile: deploy/Dockerfile }
+    command: ["coordinator", "-listen", ":8080", "-timeout", "3s"]
+    ports: ["8080:8080"]            # curl http://localhost:8080/status
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  node1: &node
+    build: { context: .., dockerfile: deploy/Dockerfile }
+    command: ["node", "-id", "node1", "-listen", ":7001", "-advertise", "node1:7001", "-coordinator", "http://coordinator:8080"]
+    ports: ["7001:7001"]            # for redis-cli / redis-benchmark from the host
+    depends_on:
+      coordinator: { condition: service_healthy }
+    restart: "no"                   # so `docker stop node2` really simulates a dead node
+
+  node2:
+    <<: *node
+    command: ["node", "-id", "node2", "-listen", ":7001", "-advertise", "node2:7001", "-coordinator", "http://coordinator:8080"]
+    ports: ["7002:7001"]
+
+  node3:
+    <<: *node
+    command: ["node", "-id", "node3", "-listen", ":7001", "-advertise", "node3:7001", "-coordinator", "http://coordinator:8080"]
+    ports: ["7003:7001"]
+
+  # Not started by `up`. Run it inside the compose network so it can resolve
+  # node1/node2/node3:   docker compose -f deploy/docker-compose.yml run --rm cachectl fill 10000
+  cachectl:
+    build: { context: .., dockerfile: deploy/Dockerfile }
+    entrypoint: ["cachectl", "-coordinator", "http://coordinator:8080"]
+    profiles: ["tools"]
+    depends_on:
+      coordinator: { condition: service_healthy }

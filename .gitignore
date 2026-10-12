@@ -1,0 +1,17 @@
+# binaries and build output
+*.exe
+*.out
+*.test
+/bin/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# local config
+.env
+
+# python (plotting script)
+__pycache__/
+*.pyc
